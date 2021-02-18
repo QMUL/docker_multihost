@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+
+# script to run an Apache instance with external config using Docker image with centos7 / Apache / PHP 
+# m.opitz@qmul.ac.uk | 2018-08-08
+if [[ $EUID -ne 0 ]]; then
+   echo "SORRY! This script must be run as root/superuser!" 
+   exit 1
+fi
+
+#echo v.2.1
+# v.0.1 - added hostmane to container
+# v.0.2 - removing all other multihost container when starting a new one and serving php5.6 over 80 / 443
+# v.0.3 - using setup details  to make changes easier
+# v.0.4 - reading setup details from /etc/multihost.conf and creating reboot_multihost command script
+# v.0.5 - renamed reboot_multihost to restart_multihost
+# v.0.6 - installing scripts into /usr/local/bin instead of /usr/sbin
+# v.1.0 - working release
+# v.1.1 - using $command_path from multihost.conf now
+# v.1.2 - using/starting cron , using IP of host as environment variable inside the docker containers
+# v.1.3 - installing crontab from ${moodledata_path}/moodle_crontab if present , checking for superuser rights
+# v.1.4 - checking the IP address the Mac way where needed
+# v.1.5 - running Docker container with --restart always option
+# v.1.6 - starting a 2nd server with the other php version on Centos7
+# v.1.7 - now reading port setting from config.php
+# v.1.8 - install symlink for each enabled VHOST inside $www_path/html to allow access via subdirectory in URL
+# v.1.9 - removed HOST_IP_ADDR settings due to incompatibility issues with ipv6
+# v.2.0 - now supporting /etc/multihost.user file on host machine for web user management
+# v.2.1 - allowing to set path to userfile in config file, fixed faulty symlink when restoring enabled VHOSTs
+# v.2.2 - adding support for Mahara data
+# v.3.0 - using PHP 7.2 and PHP 7.4
+
+usage() { echo "Usage: $0 [-o<c/u>] [-p<7/5>]" 1>&2; exit 1; }
+
+# check for the config file and get the settings
+if [ ! -f /etc/multihost.conf ]
+        then
+        echo "ERROR! Could not read configuration file at /etc/multihost.conf - aborting!"
+        exit 1
+fi
+. /etc/multihost.conf
+
+# if no ports have been declared in multihost.conf use default values
+if [ "$ssl_port" == "" ]
+	then
+	port=80
+	ssl_port=443
+	port2=8080
+	ssl_port2=8443
+fi
+
+# get ip address of machine the docker containers are running on
+if [ "`uname`" == "Darwin" ]
+	then
+	ip=$(ipconfig getifaddr en0)
+	if [ ! $ip  ]
+		then
+		ip=$(ipconfig getifaddr en1)
+	fi
+else
+	ip=$(hostname -i)
+fi
+echo "--> Running on IP address $ip"
+
+# get options
+while getopts ":p:o:" x; do
+    case "${x}" in
+        o)
+            o=${OPTARG}
+            ;;
+        p)
+            p=${OPTARG}
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+shift $((OPTIND-1))
+
+# if option -p5 is set use PHP 7.2 otherwise use PHP 7.4 by default
+if [ "${p}" == "5" ]
+	then
+	php_v=72
+	php_v2=74
+else
+	php_v=74
+	php_v2=72
+fi
+
+# remove any exsiting multihost container, running or not
+docker rm -f multihost_centos7_php7_httpd >/dev/null 2>/dev/null
+docker rm -f multihost_centos7_php56_httpd >/dev/null 2>/dev/null
+docker rm -f multihost_ubuntu_php7_apache2 >/dev/null 2>/dev/null
+docker rm -f multihost_ubuntu_php56_apache2 >/dev/null 2>/dev/null
+
+# check if an option is set to use Ubuntu as OS otherwise use Centos by default
+if [ "${o}" == "u" ]
+	then
+	conf_path=/etc/apache2/sites-enabled
+	os=ubuntu_php${php_v}_apache2
+	os2=ubuntu_php${php_v2}_apache2
+	servername=multihost_${os}
+	servername2=multihost_${os2}
+
+#	run the 1st Ubuntu server
+	docker run -itd \
+		--name ${servername} \
+		-h ${servername} \
+		-p ${port}:80 \
+		-p ${ssl_port}:443 \
+		-v ${sites_enabled_path}:${conf_path} \
+		-v ${www_path}:/var/www \
+		-v ${moodledata_path}:/var/moodledata \
+		-v ${maharadata_path}:/var/maharadata \
+		-v ${filedir_path}:/filedir \
+		-v ${xchange_path}:/xchange \
+        -v ${setup_path}/multihost.conf:/etc/multihost.conf \
+        -v ${setup_path}/multihost.user:/etc/multihost.user \
+		--add-host db_host:${db_host_ip} \
+		--add-host laptop:${laptop_ip} \
+		--restart always \
+		${os} >/dev/null
+	docker exec ${servername} service apache2 restart
+	echo "docker exec ${servername} service apache2 restart">${command_path}/restart_multihost
+
+#	run the 2nd Ubuntu server
+	docker run -itd \
+		--name ${servername2} \
+		-h ${servername2} \
+		-p ${port2}:80 \
+		-p ${ssl_port2}:443 \
+		-v ${sites_enabled_path}:${conf_path} \
+		-v ${www_path}:/var/www \
+		-v ${moodledata_path}:/var/moodledata \
+		-v ${maharadata_path}:/var/maharadata \
+		-v ${filedir_path}:/filedir \
+		-v ${xchange_path}:/xchange \
+        -v ${setup_path}/multihost.conf:/etc/multihost.conf \
+        -v ${setup_path}/multihost.user:/etc/multihost.user \
+		--add-host db_host:${db_host_ip} \
+		--add-host laptop:${laptop_ip} \
+		--restart always \
+		${os2} >/dev/null
+	docker exec ${servername2} service apache2 restart
+	echo "docker exec ${servername2} service apache2 restart">>${command_path}/restart_multihost
+else
+	conf_path=/etc/httpd/sites-enabled
+	os=centos7_php${php_v}_httpd
+	os2=centos7_php${php_v2}_httpd
+	servername=multihost_${os}
+	servername2=multihost_${os2}
+
+#	run the 1st Centos server
+	docker run -itd \
+		--privileged=true \
+		--name ${servername} \
+		-h ${servername} \
+		-p ${port}:80 \
+		-p ${ssl_port}:443 \
+		-v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+		-v ${sites_enabled_path}:${conf_path} \
+		-v ${www_path}:/var/www \
+		-v ${moodledata_path}:/var/moodledata \
+		-v ${maharadata_path}:/var/maharadata \
+		-v ${filedir_path}:/filedir \
+		-v ${xchange_path}:/xchange \
+        -v ${setup_path}/multihost.conf:/etc/multihost.conf \
+        -v ${setup_path}/multihost.user:/etc/multihost.user \
+		--add-host db_host:${db_host_ip} \
+		--add-host laptop:${laptop_ip} \
+		--restart always \
+		${os} >/dev/null
+	docker exec ${servername} systemctl enable httpd > /dev/null 2> /dev/null
+	docker exec ${servername} systemctl enable crond > /dev/null 2> /dev/null
+	docker exec ${servername} systemctl start crond
+	docker exec ${servername} systemctl restart httpd
+	echo "docker exec ${servername} systemctl restart httpd">${command_path}/restart_multihost
+	echo "echo '--> Apache server on ${servername} has been restarted'">>${command_path}/restart_multihost
+
+#	run the 2nd Centos server
+	docker run -itd \
+		--privileged=true \
+		--name ${servername2} \
+		-h ${servername2} \
+		-p ${port2}:80 \
+		-p ${ssl_port2}:443 \
+		-v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+		-v ${sites_enabled_path}:${conf_path} \
+		-v ${www_path}:/var/www \
+		-v ${moodledata_path}:/var/moodledata \
+		-v ${maharadata_path}:/var/maharadata \
+		-v ${filedir_path}:/filedir \
+		-v ${xchange_path}:/xchange \
+        -v ${setup_path}/multihost.conf:/etc/multihost.conf \
+        -v ${setup_path}/multihost.user:/etc/multihost.user \
+		--add-host db_host:${db_host_ip} \
+		--add-host laptop:${laptop_ip} \
+		--restart always \
+		${os2} >/dev/null
+#	docker exec ${servername} systemctl start crond - no 2nd cron job here, the 1st server takes care already
+	docker exec ${servername2} systemctl enable httpd > /dev/null 2> /dev/null
+	docker exec ${servername2} systemctl restart httpd
+	echo "docker exec ${servername2} systemctl restart httpd">>${command_path}/restart_multihost
+	echo "echo '--> Apache server on ${servername2} has been restarted'">>${command_path}/restart_multihost
+fi
+
+echo "--> server 1 running ${servername} with PHP${php_v} on ports ${port} / ${ssl_port}."
+echo "--> server 2 running ${servername2} with PHP${php_v2} on ports ${port2} / ${ssl_port2}."
+
+# install the crontab (on the 1st server only)
+if [ -f ${moodledata_path}/moodle_crontab ]
+	then
+	docker exec ${servername} crontab /var/moodledata/moodle_crontab
+	echo "docker exec ${servername} crontab /var/moodledata/moodle_crontab">>${command_path}/restart_multihost
+fi
+
+# write the ip address of host to a file 'ip.txt' and the creation date to a file "created.txt" inside the 'multihost' VHOST so it can be displayed from a web server that runs inside the docker container
+if [ -d $www_path/html ]
+	then
+	echo $ip > $www_path/html/ip.txt
+	docker images $os --format "{{.CreatedAt}}" > $www_path/html/created$port.txt
+	docker images $os --format "{{.CreatedAt}}" > $www_path/html/created$ssl_port.txt
+	docker images $os2 --format "{{.CreatedAt}}" > $www_path/html/created$port2.txt
+	docker images $os2 --format "{{.CreatedAt}}" > $www_path/html/created$ssl_port2.txt
+
+	echo $port > $www_path/html/port.txt
+	echo $ssl_port > $www_path/html/ssl_port.txt
+	echo $port2 > $www_path/html/port2.txt
+	echo $ssl_port2 > $www_path/html/ssl_port2.txt
+
+	chmod 755 $www_path/html/*.txt 2>/dev/null
+fi
+echo "--> placing symlinks for enabled VHOSTs"
+# finally check for all enabled VHOSTs and create a symlink for each one insde the default html instance
+for D in `find ${www_path} -mindepth 1 -maxdepth 1 -type d`
+do
+	DD=$(basename $D)
+	if [ -f ${sites_enabled_path}/${DD}.conf ]
+		then
+		rm -rf ${www_path}/html/$DD >/dev/null 2>/dev/null
+		ln -s /var/www/$DD ${www_path}/html/$DD
+	fi
+done
+
